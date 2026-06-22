@@ -19,6 +19,8 @@ QUEUE_STATUS = {
   cancelled: 'cancelled'
 }.freeze
 
+AVG_WAIT_MINUTES_PER_TABLE = 15
+
 def init_db
   db = SQLite3::Database.new(DB_PATH)
 
@@ -113,6 +115,22 @@ def count_ahead(token)
   end
 end
 
+def estimate_wait_minutes(ahead_count)
+  ahead_count * AVG_WAIT_MINUTES_PER_TABLE
+end
+
+def format_wait_time(minutes)
+  if minutes == 0
+    '即将叫号'
+  elsif minutes < 60
+    "约#{minutes}分钟"
+  else
+    hours = minutes / 60
+    mins = minutes % 60
+    mins == 0 ? "约#{hours}小时" : "约#{hours}小时#{mins}分钟"
+  end
+end
+
 def get_next_customer(table_type)
   vip_customer = get_db.execute(<<-SQL, table_type, QUEUE_STATUS[:waiting]).first
     SELECT * FROM queue_items
@@ -197,7 +215,11 @@ post '/api/take-number' do
   id = get_db.last_insert_row_id
   row = get_db.execute('SELECT * FROM queue_items WHERE id = ?', id).first
   item = build_queue_item_hash(row)
-  item[:ahead_count] = count_ahead(token)
+  ahead = count_ahead(token)
+  item[:ahead_count] = ahead
+  wait_minutes = estimate_wait_minutes(ahead)
+  item[:estimated_wait_minutes] = wait_minutes
+  item[:estimated_wait_text] = format_wait_time(wait_minutes)
 
   status 201
   json item
@@ -214,7 +236,11 @@ get '/api/queue-status/:token' do
   end
 
   item = build_queue_item_hash(row)
-  item[:ahead_count] = count_ahead(token)
+  ahead = count_ahead(token)
+  item[:ahead_count] = ahead
+  wait_minutes = estimate_wait_minutes(ahead)
+  item[:estimated_wait_minutes] = wait_minutes
+  item[:estimated_wait_text] = format_wait_time(wait_minutes)
 
   json item
 end
@@ -257,6 +283,36 @@ post '/api/complete/:token' do
 
   now = Time.now.iso8601
   get_db.execute(<<-SQL, QUEUE_STATUS[:completed], now, token)
+    UPDATE queue_items SET status = ?, completed_at = ? WHERE token = ?
+  SQL
+
+  row = get_db.execute('SELECT * FROM queue_items WHERE token = ?', token).first
+  json build_queue_item_hash(row)
+end
+
+post '/api/cancel/:token' do
+  token = params['token'].to_s.upcase
+
+  row = get_db.execute('SELECT * FROM queue_items WHERE token = ?', token).first
+  unless row
+    status 404
+    return json error: '取号凭证不存在'
+  end
+
+  current_status = row[5]
+  if current_status != QUEUE_STATUS[:waiting]
+    status 400
+    status_text = case current_status
+                  when QUEUE_STATUS[:called] then '已叫号'
+                  when QUEUE_STATUS[:completed] then '已完成就餐'
+                  when QUEUE_STATUS[:cancelled] then '已取消'
+                  else current_status
+                  end
+    return json error: "当前状态为#{status_text}，无法取消"
+  end
+
+  now = Time.now.iso8601
+  get_db.execute(<<-SQL, QUEUE_STATUS[:cancelled], now, token)
     UPDATE queue_items SET status = ?, completed_at = ? WHERE token = ?
   SQL
 
