@@ -49,6 +49,13 @@ STATUS_CALLED = 'called'.freeze
 STATUS_COMPLETED = 'completed'.freeze
 STATUS_CANCELLED = 'cancelled'.freeze
 
+DEFAULT_AVG_DINING_MINUTES = {
+  'small' => 45,
+  'large' => 75
+}.freeze
+
+HISTORY_WINDOW_DAYS = 7.freeze
+
 helpers do
   def generate_ticket_no(table_type, is_vip)
     prefix = is_vip ? 'V' : (table_type == 'large' ? 'L' : 'S')
@@ -93,7 +100,35 @@ helpers do
     obj.is_a?(DateTime) ? obj.to_time.iso8601 : obj.iso8601
   end
 
+  def average_dining_minutes(table_type)
+    since = Date.today - HISTORY_WINDOW_DAYS
+    completed = Ticket.where(
+      table_type: table_type,
+      status: STATUS_COMPLETED
+    ).where { completed_at >= since }.all
+
+    durations = completed.filter_map do |t|
+      next unless t.called_at && t.completed_at
+      (t.completed_at.to_time - t.called_at.to_time) / 60.0
+    end
+
+    if durations.size >= 3
+      (durations.sum / durations.size).round(1)
+    else
+      DEFAULT_AVG_DINING_MINUTES[table_type].to_f
+    end
+  end
+
+  def estimate_wait_minutes(ticket)
+    return 0 unless ticket.status == STATUS_WAITING
+    ahead_count = [ticket.queue_position - 1, 0].max
+    avg_minutes = average_dining_minutes(ticket.table_type)
+    (ahead_count * avg_minutes).round(0).to_i
+  end
+
   def build_ticket_response(ticket, ahead_count = nil)
+    wait_minutes = estimate_wait_minutes(ticket)
+    avg_minutes = average_dining_minutes(ticket.table_type)
     resp = {
       ticket_no: ticket.ticket_no,
       token: ticket.token,
@@ -101,7 +136,9 @@ helpers do
       is_vip: ticket.is_vip,
       status: ticket.status,
       created_at: to_iso8601(ticket.created_at),
-      called_at: to_iso8601(ticket.called_at)
+      called_at: to_iso8601(ticket.called_at),
+      estimated_wait_minutes: wait_minutes,
+      avg_dining_minutes: avg_minutes
     }
     resp[:ahead_count] = ahead_count unless ahead_count.nil?
     resp[:queue_position] = ticket.queue_position if ticket.status == STATUS_WAITING
