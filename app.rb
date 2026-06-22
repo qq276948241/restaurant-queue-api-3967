@@ -53,7 +53,7 @@ class QueueItem < Sequel::Model
   def validate
     super
     validates_includes %w[large small], :table_type
-    validates_includes %w[waiting called completed cancelled], :status
+    validates_includes %w[waiting called completed cancelled expired], :status
   end
 
   def self.generate_queue_number(table_type, vip)
@@ -82,6 +82,22 @@ class QueueItem < Sequel::Model
     index = waiting.index { |w| w.id == item.id }
     index || 0
   end
+
+  def self.expire_timeout!(timeout_seconds = 180)
+    now = Time.now
+    threshold = now - timeout_seconds
+    items = where(status: 'called')
+            .where(Sequel[:called_at] <= threshold)
+            .all
+    items.each do |item|
+      item.update(status: 'expired')
+    end
+    items.size
+  end
+
+  def self.estimate_wait_time(table_type, ahead_count)
+    (ahead_count + 1) * 15
+  end
 end
 
 class CallRecord < Sequel::Model
@@ -89,6 +105,7 @@ end
 
 before do
   content_type :json
+  QueueItem.expire_timeout!
 end
 
 helpers do
@@ -127,6 +144,7 @@ post '/api/take_number' do
   )
 
   ahead_count = QueueItem.count_ahead(customer_token)
+  estimated_wait = QueueItem.estimate_wait_time(table_type, ahead_count)
 
   json(
     queue_number: item.queue_number,
@@ -135,6 +153,7 @@ post '/api/take_number' do
     vip: item.vip,
     status: item.status,
     ahead_count: ahead_count,
+    estimated_wait_minutes: estimated_wait,
     created_at: item.created_at.iso8601
   )
 end
@@ -185,6 +204,7 @@ get '/api/queue_status/:customer_token' do
   end
 
   ahead_count = QueueItem.count_ahead(customer_token)
+  estimated_wait = item.status == 'waiting' ? QueueItem.estimate_wait_time(item.table_type, ahead_count) : 0
 
   json(
     queue_number: item.queue_number,
@@ -192,6 +212,7 @@ get '/api/queue_status/:customer_token' do
     vip: item.vip,
     status: item.status,
     ahead_count: ahead_count,
+    estimated_wait_minutes: estimated_wait,
     created_at: item.created_at.iso8601,
     called_at: item.called_at&.iso8601,
     message: case item.status
@@ -199,6 +220,7 @@ get '/api/queue_status/:customer_token' do
              when 'called' then 'Your turn! Please proceed to your table'
              when 'completed' then 'Your visit has been completed'
              when 'cancelled' then 'Your queue has been cancelled'
+             when 'expired' then 'Your queue has expired (no-show). You can requeue at the end of the line.'
              end
   )
 end
@@ -238,6 +260,7 @@ get '/api/stats/today' do
     vip_count: items_today.where(vip: true).count,
     currently_waiting: QueueItem.where(status: 'waiting').count,
     currently_called: QueueItem.where(status: 'called').count,
+    expired_count: items_today.where(status: 'expired').count,
     completed_count: items_today.where(status: 'completed').count,
     peak_hour: peak_hour ? peak_hour[:time_range] : nil,
     peak_customers: peak_hour ? peak_hour[:total_customers] : 0
@@ -267,7 +290,7 @@ get '/api/queue/list' do
 
   items = QueueItem
   items = items.where(table_type: table_type) if table_type && %w[large small].include?(table_type)
-  items = items.where(status: status) if status && %w[waiting called completed cancelled].include?(status)
+  items = items.where(status: status) if status && %w[waiting called completed cancelled expired].include?(status)
 
   result = items.order(Sequel.desc(:vip), Sequel.desc(:priority), Sequel.asc(:created_at))
                 .map do |item|
@@ -315,6 +338,63 @@ put '/api/queue/:customer_token/cancel' do
   json message: 'Queue cancelled successfully', status: item.status
 end
 
+put '/api/queue/:customer_token/requeue' do
+  item = QueueItem.where(customer_token: params[:customer_token]).first
+
+  unless item
+    status 404
+    return json error: 'Invalid customer token'
+  end
+
+  unless item.status == 'expired'
+    status 400
+    return json error: 'Only expired (no-show) customers can requeue'
+  end
+
+  max_priority = QueueItem.where(table_type: item.table_type, status: 'waiting')
+                          .max(:priority) || 0
+
+  item.update(
+    status: 'waiting',
+    vip: false,
+    priority: 0,
+    called_at: nil,
+    created_at: Time.now
+  )
+
+  ahead_count = QueueItem.count_ahead(item.customer_token)
+  estimated_wait = QueueItem.estimate_wait_time(item.table_type, ahead_count)
+
+  json(
+    message: 'Requeued successfully at the end of the line',
+    queue_number: item.queue_number,
+    status: item.status,
+    ahead_count: ahead_count,
+    estimated_wait_minutes: estimated_wait
+  )
+end
+
 get '/health' do
   json status: 'ok', time: Time.now.iso8601
+end
+
+post '/api/test/simulate_timeout' do
+  params = parse_request_body
+  item = QueueItem.where(customer_token: params['customer_token']).first
+
+  unless item
+    status 404
+    return json error: 'Invalid customer token'
+  end
+
+  unless item.status == 'called'
+    status 400
+    return json error: 'Customer is not in called status'
+  end
+
+  item.update(called_at: Time.now - 240)
+
+  QueueItem.expire_timeout!
+
+  json message: 'Simulated timeout: called_at set to 4 minutes ago, expired check triggered', status: item.reload.status
 end
