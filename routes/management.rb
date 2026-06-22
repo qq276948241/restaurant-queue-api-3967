@@ -10,6 +10,11 @@ put '/api/queue/:customer_token/complete' do
     return json error: 'Invalid customer token'
   end
 
+  unless item.status == 'called'
+    status 400
+    return json error: "Cannot complete a customer in '#{item.status}' status. Only 'called' status can be completed."
+  end
+
   item.update(
     status: 'completed',
     completed_at: Time.now

@@ -53,8 +53,8 @@ get '/api/queue_status/:customer_token' do
     return json error: 'Invalid customer token'
   end
 
-  ahead_count = QueueItem.count_ahead(customer_token)
-  estimated_wait = item.status == 'waiting' ? QueueItem.estimate_wait_time(item.table_type, ahead_count) : 0
+  ahead_count = item.status == 'waiting' ? QueueItem.count_ahead(customer_token) : nil
+  estimated_wait = item.status == 'waiting' ? QueueItem.estimate_wait_time(item.table_type, ahead_count) : nil
 
   json(
     queue_number: item.queue_number,
@@ -85,7 +85,7 @@ get '/api/queue/list' do
 
   result = items.order(Sequel.desc(:vip), Sequel.desc(:priority), Sequel.asc(:created_at))
                 .map do |item|
-    ahead_count = item.status == 'waiting' ? QueueItem.count_ahead(item.customer_token) : 0
+    ahead_count = item.status == 'waiting' ? QueueItem.count_ahead(item.customer_token) : nil
     {
       queue_number: item.queue_number,
       table_type: item.table_type,
