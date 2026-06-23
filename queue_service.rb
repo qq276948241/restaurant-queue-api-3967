@@ -12,7 +12,6 @@ module QueueService
 
   def self.take_number(table_type, vip: false)
     ticket_number = next_number(table_type)
-    position = vip ? assign_position_top(table_type) : assign_position_bottom(table_type)
     token = SecureRandom.hex(8)
 
     ticket = QueueTicket.create(
@@ -21,21 +20,20 @@ module QueueService
       table_type: table_type,
       vip: vip,
       status: 'waiting',
-      position: position,
+      position: 0,
       miss_count: 0
     )
 
+    normalize_positions(table_type)
+    ticket.refresh
     enrich_ticket(ticket)
   end
 
   def self.call_next(table_type)
     process_expired_calls(table_type)
 
-    vip_waiting = QueueTicket.where(table_type: table_type, status: 'waiting', vip: true)
-                             .order(:position).first
-
-    candidate = vip_waiting || QueueTicket.where(table_type: table_type, status: 'waiting')
-                                          .order(:position).first
+    candidate = QueueTicket.where(table_type: table_type, status: 'waiting')
+                           .order(:position).first
 
     return nil unless candidate
 
@@ -43,6 +41,8 @@ module QueueService
     candidate.called_at = Time.now
     candidate.save
 
+    normalize_positions(table_type)
+    candidate.refresh
     enrich_ticket(candidate)
   end
 
@@ -62,9 +62,11 @@ module QueueService
                         .where(status: %w[waiting called]).first
     return nil unless ticket
 
+    table_type = ticket.table_type
     ticket.status = 'cancelled'
     ticket.save
 
+    normalize_positions(table_type)
     enrich_ticket(ticket)
   end
 
@@ -72,7 +74,10 @@ module QueueService
     ticket = QueueTicket.where(ticket_token: ticket_token, status: 'called').first
     return nil unless ticket
 
+    table_type = ticket.table_type
     result = process_miss(ticket)
+    normalize_positions(table_type)
+    result.refresh
     enrich_ticket(result)
   end
 
@@ -162,7 +167,6 @@ module QueueService
 
   def self.vip_insert(table_type)
     ticket_number = next_number(table_type)
-    position = assign_position_top(table_type)
     token = SecureRandom.hex(8)
 
     ticket = QueueTicket.create(
@@ -171,10 +175,12 @@ module QueueService
       table_type: table_type,
       vip: true,
       status: 'waiting',
-      position: position,
+      position: 0,
       miss_count: 0
     )
 
+    normalize_positions(table_type)
+    ticket.refresh
     enrich_ticket(ticket)
   end
 
@@ -188,6 +194,17 @@ module QueueService
 
   private
 
+  def self.normalize_positions(table_type)
+    tickets = QueueTicket.where(table_type: table_type, status: 'waiting')
+                         .order(:miss_count, Sequel.desc(:vip), :created_at)
+    pos = 1
+    tickets.each do |t|
+      t.position = pos
+      t.save(validate: false)
+      pos += 1
+    end
+  end
+
   def self.next_number(table_type)
     today = Date.today
     counter = DailyCounter.find_or_create(table_type: table_type, date: today) do |c|
@@ -196,19 +213,6 @@ module QueueService
     counter.counter += 1
     counter.save
     counter.counter
-  end
-
-  def self.current_max_position(table_type)
-    QueueTicket.where(table_type: table_type, status: 'waiting').max(:position) || 0
-  end
-
-  def self.assign_position_bottom(table_type)
-    current_max_position(table_type) + 1
-  end
-
-  def self.assign_position_top(table_type)
-    min_pos = QueueTicket.where(table_type: table_type, status: 'waiting').min(:position)
-    min_pos ? min_pos - 1 : 1
   end
 
   def self.waiting_ahead(ticket)
@@ -236,7 +240,6 @@ module QueueService
       ticket.status = 'missed'
     else
       ticket.status = 'waiting'
-      ticket.position = assign_position_bottom(ticket.table_type)
       ticket.called_at = nil
     end
     ticket.save
@@ -264,10 +267,6 @@ module QueueService
 
     if include_waiting
       base[:waiting_count] = QueueTicket.where(table_type: ticket.table_type, status: 'waiting').count
-    end
-
-    if ticket.status == 'waiting' && ticket.miss_count.to_i > 0
-      base[:new_position] = ticket.position
     end
 
     base
