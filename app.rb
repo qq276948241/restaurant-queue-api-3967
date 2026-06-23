@@ -21,9 +21,16 @@ Sequel.migration do
       TrueClass :vip, default: false
       String :status, default: 'waiting'
       Integer :position, default: 0
+      Integer :miss_count, default: 0
       DateTime :created_at, default: Sequel::CURRENT_TIMESTAMP
       DateTime :called_at
       DateTime :served_at
+    end
+
+    unless DB[:queue_tickets].columns.include?(:miss_count)
+      alter_table :queue_tickets do
+        add_column :miss_count, Integer, default: 0
+      end
     end
 
     create_table? :daily_counters do
@@ -56,7 +63,10 @@ class QueueApp < Sinatra::Base
   end
 
   TABLE_TYPES = %w[small large].freeze
-  VALID_STATUSES = %w[waiting called served cancelled].freeze
+  VALID_STATUSES = %w[waiting called served cancelled missed].freeze
+  MAX_MISS = 2
+  CALL_TIMEOUT_SECONDS = 180
+  AVG_MEAL_MINUTES = { 'small' => 30, 'large' => 45 }.freeze
 
   def today
     Date.today
@@ -95,6 +105,34 @@ class QueueApp < Sinatra::Base
     new_pos
   end
 
+  def process_expired_calls(table_type)
+    cutoff = Time.now - CALL_TIMEOUT_SECONDS
+    expired = QueueTicket.where(table_type: table_type, status: 'called')
+                         .where { called_at < cutoff }
+                         .all
+    expired.each do |ticket|
+      handle_miss(ticket)
+    end
+  end
+
+  def handle_miss(ticket)
+    ticket.miss_count = (ticket.miss_count || 0) + 1
+    if ticket.miss_count >= MAX_MISS
+      ticket.status = 'missed'
+    else
+      ticket.status = 'waiting'
+      ticket.position = assign_position_bottom(ticket.table_type)
+      ticket.called_at = nil
+    end
+    ticket.save
+    ticket
+  end
+
+  def estimate_wait_minutes(table_type, ahead_count)
+    per_table = AVG_MEAL_MINUTES[table_type] || 30
+    ahead_count * per_table
+  end
+
   post '/api/queue/take' do
     body = request.body.read
     params = JSON.parse(body) rescue {}
@@ -117,10 +155,12 @@ class QueueApp < Sinatra::Base
       table_type: table_type,
       vip: vip,
       status: 'waiting',
-      position: position
+      position: position,
+      miss_count: 0
     )
 
     ahead = waiting_ahead(ticket)
+    wait_min = estimate_wait_minutes(table_type, ahead)
 
     status 201
     json \
@@ -130,6 +170,7 @@ class QueueApp < Sinatra::Base
       vip: ticket.vip,
       position: ticket.position,
       ahead_count: ahead,
+      estimated_wait_minutes: wait_min,
       status: ticket.status,
       created_at: ticket.created_at.iso8601
   end
@@ -144,6 +185,8 @@ class QueueApp < Sinatra::Base
       status 400
       return json error: 'invalid table_type, must be small or large'
     end
+
+    process_expired_calls(table_type)
 
     vip_waiting = QueueTicket.where(table_type: table_type, status: 'waiting', vip: true).order(:position).first
 
@@ -163,8 +206,33 @@ class QueueApp < Sinatra::Base
       ticket_number: candidate.ticket_number,
       table_type: candidate.table_type,
       vip: candidate.vip,
+      miss_count: candidate.miss_count,
       status: candidate.status,
       called_at: candidate.called_at.iso8601
+  end
+
+  post '/api/queue/miss' do
+    body = request.body.read
+    params = JSON.parse(body) rescue {}
+
+    token = params['ticket_token']
+
+    ticket = QueueTicket.where(ticket_token: token, status: 'called').first
+
+    unless ticket
+      status 404
+      return json error: 'no called ticket found with this token'
+    end
+
+    result = handle_miss(ticket)
+
+    json \
+      ticket_token: result.ticket_token,
+      ticket_number: result.ticket_number,
+      table_type: result.table_type,
+      miss_count: result.miss_count,
+      status: result.status,
+      new_position: result.status == 'waiting' ? result.position : nil
   end
 
   post '/api/queue/confirm_served' do
@@ -222,6 +290,7 @@ class QueueApp < Sinatra::Base
     end
 
     ahead = ticket.status == 'waiting' ? waiting_ahead(ticket) : 0
+    wait_min = ticket.status == 'waiting' ? estimate_wait_minutes(ticket.table_type, ahead) : 0
 
     waiting_count = QueueTicket.where(table_type: ticket.table_type, status: 'waiting').count
 
@@ -231,7 +300,9 @@ class QueueApp < Sinatra::Base
       table_type: ticket.table_type,
       vip: ticket.vip,
       status: ticket.status,
+      miss_count: ticket.miss_count,
       ahead_count: ahead,
+      estimated_wait_minutes: wait_min,
       waiting_count: waiting_count,
       created_at: ticket.created_at.iso8601,
       called_at: ticket.called_at&.iso8601,
@@ -278,10 +349,12 @@ class QueueApp < Sinatra::Base
       table_type: table_type,
       vip: true,
       status: 'waiting',
-      position: position
+      position: position,
+      miss_count: 0
     )
 
     ahead = waiting_ahead(ticket)
+    wait_min = estimate_wait_minutes(table_type, ahead)
 
     status 201
     json \
@@ -291,6 +364,7 @@ class QueueApp < Sinatra::Base
       vip: true,
       position: ticket.position,
       ahead_count: ahead,
+      estimated_wait_minutes: wait_min,
       status: ticket.status,
       created_at: ticket.created_at.iso8601
   end
